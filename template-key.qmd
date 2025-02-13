@@ -1,0 +1,304 @@
+---
+title: "Lab 6: Random Forests Key"
+author: "Nathaniel Grimes"
+format: 
+  html:
+    embed-resources: true
+    code-fold: show
+execute:
+  message: false
+  warning: false
+---
+
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(ggcorrplot)
+library(knitr)
+library(kableExtra)
+```
+
+## Random Forests
+
+Random Forests are a powerful machine learning algorithm used extensively in all environmental science and is seeing an increase in use due to the explosion of satellite data. Today in lab we will showcase its performance for both a classification and regression tasks using `tidymodels`. The walkthrough demonstration will pertain to the classification task, while the lab exercise will pertain to the regression task.
+
+## Data exploration
+
+Our dataset is coming from the maternal health risk as part of the UCI machine learning data archive. It is a collection of health factors taken from pregnant mothers across Bangladesh. The relative risk [`risk_level`] of maternal heart attacks while pregant will be our dependent variable. [Read more about the dataset and project here](https://archive.ics.uci.edu/dataset/863/maternal+health+risk). The data is already well cleaned, so we will have minimal data cleaning to do. One fun application of this dataset, is that it allows us to test multinomial outcomes and not just binary as we've done up to this point. There are three categories of risk. Technically they are ordinal because high risk superceeds, medium and low, but for now we'll treat them as nominal factors.
+
+Variables:
+
+1. Age, age of mother while pregnant 
+2. systolic_bp, Upp veral of blood pressure in mmHg
+3. diastolic_bp, Lower veral of blood pressure in mmHg
+4. bs, blood clucose levels in mmol/l
+5. body_temp, in degrees F
+6. heart_rate, resting heart rate in bpm
+
+
+### Load in data
+
+```{r}
+mom<-read_csv(here::here('data','maternal_health.csv')) |> 
+  janitor::clean_names()
+```
+
+### Data visualization
+
+Correlation heatmaps are cool looking ways to get a quick overview of potential overlap in our variables.
+
+```{r}
+#| label: fig-corr-map
+#| fig-cap: "Correlation heatmap indicates relatively low levels of correlation across all independent variables. The most striking is between systolic and diastolic blood pressure, which is unsurprising. Could be potential features to reduce in the future."
+mom %>% 
+  select(-risk_level) %>% 
+  cor() %>% 
+  ggcorrplot(
+    method = "circle",
+    type='upper',
+    outline.col = "black",
+  )
+```
+
+With any classification routine, we always need to check the relative balance of our classes. 
+
+```{r}
+mom %>%
+  group_by(risk_level) |> 
+  summarize(n = n()) |> 
+  ungroup() |> 
+  mutate(prop = n / sum(n)) |> 
+  mutate(prop=scales::percent(prop)) |> 
+  kable(col.names = c("Risk Level","Number of Women","% of Total")) |> 
+  kable_styling()
+```
+
+
+
+## Build Random Forest
+
+Pseudocode:
+
+1. Split data maintaining balance
+
+2. Build recipe
+
+3. Set engine
+
+4. Hyperparameter tuning on training set
+
+  a. Build grid to go over parameters
+  
+  b. Use cross validation to select best parameters
+  
+  c. Train model on best parameters
+  
+5. Evaluate model on test set
+
+6. Test for variable importance
+
+
+### Split data
+
+Use the `strata` argument to maintain balance in the split.
+
+
+```{r}
+set.seed(123)
+
+mom_split <- initial_split(mom, prop = 0.75, strata = risk_level)
+
+mom_train <- training(mom_split)
+
+mom_test <- testing(mom_split)
+```
+
+
+### Build recipe
+
+The data is clean for now. We'll just use the correlation threshold to remove any highly correlated variables and any variables that have zero variance. Our data is small enough to observe by hand, but these are good steps in case our data gets too big.
+
+
+
+```{r}
+mom_recipe <- recipe(risk_level ~ ., data = mom_train) |> 
+  step_zv(all_predictors()) |> 
+  step_corr(all_predictors(), threshold = 0.9)
+```
+
+
+### Set Engine
+
+We'll use the `ranger` engine for this model. It is a fast implementation of random forests. We have to tell R here that we plan to tune our parameters. The `tune()` function tells tidymodels to be ready to recieve a combination of different parameters. We can also set the workflow in this instance as well.
+
+
+```{r}
+rf_spec <- rand_forest(trees = 1000, 
+                       mtry = tune(),
+                       min_n=tune()) |>
+  set_engine("ranger") |>
+  set_mode("classification")
+
+rf_workflow <- workflow() |>
+  add_recipe(mom_recipe) |>
+  add_model(rf_spec)
+```
+
+### Hyperparameter tuning
+
+R can use defaults to create reasonable grid, but let's make a manual grid in case you need to adjust the parameters on your own in the future. The `expand_grid` function is a great way to create a grid of all possible combinations of parameters. We'll use the `tune_grid` function to test all these combinations. We'll use 5 fold cross validation to test the model.
+
+```{r}
+rf_grid= expand_grid(
+  mtry = seq(1,6,by=2),
+  min_n = seq(2, 8,by=2)
+)
+
+rf_res <- tune_grid(
+  rf_workflow,
+  resamples = vfold_cv(mom_train, v = 5),
+  grid = rf_grid,
+  control=control_grid(save_workflow = TRUE)  # This is useful when finalizing the model
+)
+```
+
+
+How did the model performance change with different parameters?
+
+```{r}
+#| label: fig-tune
+#| fig-cap: "The AUC of the model is highest when mtry is 3 and min_n is 2. The model is relatively stable across all parameters."
+
+rf_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  mutate(min_n = factor(min_n)) %>%
+  ggplot(aes(mtry, mean, color = min_n)) +
+  geom_line(alpha = 0.5, linewidth = 1.5) +
+  geom_point() +
+  labs(y = "AUC")
+```
+
+
+### Finalize model
+
+```{r}
+rf_best<-select_best(rf_res,metric='roc_auc')
+
+rf_final<-finalize_model(rf_spec,rf_best)
+
+# finalize workflow
+
+final_wf <- workflow() %>%
+  add_recipe(mom_recipe) %>%
+  add_model(rf_final)
+
+final_res <- final_wf %>%
+  last_fit(mom_split)
+```
+
+
+### Evaluate the output using a confusion matrix
+
+```{r}
+final_res %>%
+  collect_predictions() |> 
+  conf_mat(risk_level,.pred_class) |> 
+  autoplot(type='heatmap')
+```
+
+What was the roc_auc and accuracy of the model?
+
+```{r}
+final_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc" | .metric == "accuracy") |> 
+  select(.metric,.estimate) |>
+  kable(col.names = c('Metric','Value')) |> 
+  kable_styling()
+```
+
+### Variable importance
+
+We take our finalized model and add the measure of importance we want to evaluate. Then we can plot the relative contribution of each variable. Blood sugar seems to be the most important contributor to heart attack risk in pregant women.
+
+```{r}
+rf_final |>
+  set_engine('ranger',importance='permutation') |> 
+  fit(risk_level~.,
+      data=juice(prep(mom_recipe))) |> 
+  vip::vip(geom='point')
+
+```
+
+
+## Compare to Multinomial regression
+
+Random Forests are great, but we need to think about whether this is the best model for our data. Let's compare it to a multinomial regression model. We'll use the same recipe as before, but we'll change the engine to `multinom_reg()`. The overarching structure is the same as before. This time we need to tune the penalty argument in the multinomial regression model. One nice thing about `tidymodels` is we can use the same recipe for both types of models as we want the same data preprocessing steps. Now if certain models need specific receipes than you would need to change and define a receipe object for both.
+
+```{r}
+mlr_spec <- multinom_reg(penalty=tune()) |>
+  set_engine("glmnet")
+
+mlr_workflow <- workflow() |>
+  add_recipe(mom_recipe) |>
+  add_model(mlr_spec)
+
+# let's tune the model
+
+mlr_grid <- grid_regular(penalty(), levels = 10)
+
+mlr_res <- tune_grid(
+  mlr_workflow,
+  resamples = vfold_cv(mom_train, v = 5),
+  grid = mlr_grid
+)
+
+# select the best model
+
+mlr_best <- select_best(mlr_res, metric = "roc_auc")
+
+mlr_final<-finalize_model(mlr_spec,mlr_best)
+
+final_wf_mlr <- workflow() %>%
+  add_recipe(mom_recipe) %>%
+  add_model(mlr_final)
+
+final_res_mlr <- final_wf_mlr %>%
+  last_fit(mom_split)
+
+
+```
+Here we present the results separately to have better control over the output in the quarto document.
+
+```{r}
+final_res_mlr %>%
+  collect_predictions() |> 
+  conf_mat(risk_level, .pred_class) |> 
+  autoplot(type='heatmap')
+```
+
+```{r}
+
+final_res_mlr %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc" | .metric == "accuracy") |> 
+  select(.metric,.estimate) |>
+  kable(col.names = c('Metric','Value')) |> 
+  kable_styling()
+```
+
+
+Check out the multinomial regression model variables of importance.
+
+```{r}
+mlr_workflow %>% 
+  finalize_workflow(mlr_best) %>%
+  fit(mom) %>%
+  pull_workflow_fit() %>%
+  tidy() |> 
+  kable() |> 
+  kable_classic_2()
+```
+
+

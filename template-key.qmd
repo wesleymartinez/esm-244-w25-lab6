@@ -16,6 +16,7 @@ library(tidyverse)
 library(ggcorrplot)
 library(knitr)
 library(kableExtra)
+library(ranger)
 ```
 
 ## Random Forests
@@ -31,7 +32,7 @@ Variables:
 1. Age, age of mother while pregnant 
 2. systolic_bp, Upp veral of blood pressure in mmHg
 3. diastolic_bp, Lower veral of blood pressure in mmHg
-4. bs, blood clucose levels in mmol/l
+4. bs, blood glucose levels in mmol/l
 5. body_temp, in degrees F
 6. heart_rate, resting heart rate in bpm
 
@@ -65,10 +66,10 @@ With any classification routine, we always need to check the relative balance of
 ```{r}
 mom %>%
   group_by(risk_level) |> 
-  summarize(n = n()) |> 
-  ungroup() |> 
-  mutate(prop = n / sum(n)) |> 
-  mutate(prop=scales::percent(prop)) |> 
+  summarize(n = n()) |> #summarize by counting all observations
+  ungroup() |> #ungroup says we don't need groups anymore
+  mutate(prop = n / sum(n)) |> # proporiton of women take number of women in group and divine by total number of women
+  mutate(prop=scales::percent(prop)) |> #converts numeric into percent
   kable(col.names = c("Risk Level","Number of Women","% of Total")) |> 
   kable_styling()
 ```
@@ -85,7 +86,7 @@ Pseudocode:
 
 3. Set engine
 
-4. Hyperparameter tuning on training set
+4. Hyperparameter tuning on training set 
 
   a. Build grid to go over parameters
   
@@ -122,8 +123,8 @@ The data is clean for now. We'll just use the correlation threshold to remove an
 
 ```{r}
 mom_recipe <- recipe(risk_level ~ ., data = mom_train) |> 
-  step_zv(all_predictors()) |> 
-  step_corr(all_predictors(), threshold = 0.9)
+  step_zv(all_predictors()) |> #if there is any varibale that has low variance this removes it
+  step_corr(all_predictors(), threshold = 0.9) #removes variables if they are correlated at 90%
 ```
 
 
@@ -134,12 +135,12 @@ We'll use the `ranger` engine for this model. It is a fast implementation of ran
 
 ```{r}
 rf_spec <- rand_forest(trees = 1000, 
-                       mtry = tune(),
+                       mtry = tune(), #how many variables at random are being chosen each time we split, tune says that we will tell R what to explore, right now there is nothing inputted
                        min_n=tune()) |>
   set_engine("ranger") |>
   set_mode("classification")
 
-rf_workflow <- workflow() |>
+rf_workflow <- workflow() |> 
   add_recipe(mom_recipe) |>
   add_model(rf_spec)
 ```
@@ -149,6 +150,7 @@ rf_workflow <- workflow() |>
 R can use defaults to create reasonable grid, but let's make a manual grid in case you need to adjust the parameters on your own in the future. The `expand_grid` function is a great way to create a grid of all possible combinations of parameters. We'll use the `tune_grid` function to test all these combinations. We'll use 5 fold cross validation to test the model.
 
 ```{r}
+#this creates a grid of ALL differet conmindations of variables to explore, use expand_grid
 rf_grid= expand_grid(
   mtry = seq(1,6,by=2),
   min_n = seq(2, 8,by=2)
@@ -156,7 +158,7 @@ rf_grid= expand_grid(
 
 rf_res <- tune_grid(
   rf_workflow,
-  resamples = vfold_cv(mom_train, v = 5),
+  resamples = vfold_cv(mom_train, v = 5), #using crossfold validation to tune
   grid = rf_grid,
   control=control_grid(save_workflow = TRUE)  # This is useful when finalizing the model
 )
@@ -201,6 +203,7 @@ final_res <- final_wf %>%
 ### Evaluate the output using a confusion matrix
 
 ```{r}
+#This is a confusion matrix
 final_res %>%
   collect_predictions() |> 
   conf_mat(risk_level,.pred_class) |> 
@@ -226,8 +229,8 @@ We take our finalized model and add the measure of importance we want to evaluat
 rf_final |>
   set_engine('ranger',importance='permutation') |> 
   fit(risk_level~.,
-      data=juice(prep(mom_recipe))) |> 
-  vip::vip(geom='point')
+      data=juice(prep(mom_recipe))) |> #preping and juicing creates the data frame?
+  vip::vip(geom='point') 
 
 ```
 
